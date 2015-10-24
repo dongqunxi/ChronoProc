@@ -225,7 +225,7 @@ def apply_rois(fn_stc, event, tmin=0.0, tmax=0.3, tstep=0.05, window=0.2,
             tbeg = tbeg + tstep
             count = count + 1
             
-def _cluster_rois(mer_path, label_list, count):
+def _cluster_sel(sel_path, label_list, stc, src, min_dist, weight, mni_subject='fsaverage'):
     """
     subfunctions of merge_ROIs
     ----------
@@ -242,39 +242,39 @@ def _cluster_rois(mer_path, label_list, count):
         belong = False
         while (i < len(class_list)) and (belong is False):
             class_label = mne.read_label(class_list[i])
-            label_name = class_label.name
             if test_label.hemi != class_label.hemi:
                 i = i + 1
                 continue
-            overlapped = len(np.intersect1d(test_label.vertices,
-                                            class_label.vertices))
-            if overlapped > 0:
-                com_label = test_label + class_label
-                pre_test = test_label.name.split('_')[0]
-                pre_class = class_label.name.split('_')[0]
-                #label_name = pre_class + '_%s-%s' %(pre_test,class_label.name.split('-')[-1])
-                if pre_test != pre_class:
-                    pre_class += ',%s' % pre_test
-                    pre_class = list(set(pre_class.split(',')))
-                    new_pre = ''
-                    for pre in pre_class[:-1]:
-                        new_pre += '%s,' % pre
-                    new_pre += pre_class[-1]
-                    label_name = '%s_%d_' % (new_pre, count) + \
-                        class_label.name.split('_')[-1]
-                os.remove(class_list[i])
-                os.remove(test_fn)
-                fn_newlabel = mer_path + '%s.label' %label_name
-                if os.path.isfile(fn_newlabel):
-                    fn_newlabel = fn_newlabel[:fn_newlabel.rfind('_')] + '_new,%s' %fn_newlabel.split('_')[-1]
-                mne.write_label(fn_newlabel, com_label)
-                class_list[i] = fn_newlabel
-                belong = True
-            i = i + 1
+            else:           
+                # Get the representative STCs for class label and test label
+                class_pca = stc.extract_label_time_course(class_label, src, mode='pca_flip')
+                test_pca = stc.extract_label_time_course(test_label, src, mode='pca_flip')
+                
+                # Mark the more apparent ROI
+                exch = False
+                class_pca_pow = np.sum(class_pca ** 2)
+                test_pca_pow = np.sum(test_pca ** 2)
+                max_pca = class_pca
+                if np.max(class_pca_pow) < np.max(test_pca_pow):
+                    max_pca = test_pca
+                    exch = True
+                
+                # Compute the similarity
+                thre = max_pca.std() * weight
+                diff =  np.abs(np.linalg.norm(class_pca) - np.linalg.norm(test_pca))
+                if diff < thre:
+                    if exch == True:
+                        os.remove(class_list[i])
+                        class_list[i] = test_fn
+                    elif exch == False:
+                        os.remove(test_fn)
+                    belong = True
+                i = i + 1
+                
         if belong is False:
             class_list.append(test_fn)
+                
     return len(class_list)
-
 
 def merge_rois(labels_path_list, group=False, evelist=['LLst','LLrt']):
     """
