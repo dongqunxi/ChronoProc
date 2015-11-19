@@ -95,7 +95,9 @@ def apply_norm(fn_stc, event, ref_event, thr=95):
         stcs.append(stc)
         fn_nr = fname[:fname.rfind('-lh')] + '_norm_1'
         stc.save(fn_nr, ftype='stc')
-    fn_avg = subjects_dir+'/fsaverage/dSPM_ROIs/%s' %(event)
+    stcs_path = subjects_dir+'/fsaverage/dSPM_ROIs/conditions/' 
+    reset_directory(stcs_path)
+    fn_avg = stcs_path + '%s' %(event)
     stcs = np.array(stcs)
     stc_avg = np.sum(stcs, axis=0)/stcs.shape[0]
     stc_avg.save(fn_avg, ftype='stc')
@@ -190,3 +192,132 @@ def apply_rois(fn_stc_list, event, min_subject='fsaverage', radius=8., tmin=0.0,
                 func_label = func_labels_rh[j]
                 func_label.save(labels_path + '/%s_%d' %(event, j))
                 j = j + 1
+
+def _cluster1_rois(mer_path, label_list):
+    """
+    subfunctions of merge_ROIs
+    ----------
+    mer_path: str
+        The directory for storing merged ROIs.
+    label_list: list
+        Labels to be merged
+    """
+    class_list = []
+    class_list.append(label_list[0])
+    for test_fn in label_list[1:]:
+        test_label = mne.read_label(test_fn)
+        i = 0
+        belong = False
+        while (i < len(class_list)) and (belong is False):
+            class_label = mne.read_label(class_list[i])
+            label_name = class_label.name
+            if test_label.hemi != class_label.hemi:
+                i = i + 1
+                continue
+            overlapped = len(np.intersect1d(test_label.vertices,
+                                            class_label.vertices))
+            if overlapped > 0:
+                com_label = test_label + class_label
+                pre_test = test_label.name.split('_')[0]
+                pre_class = class_label.name.split('_')[0]
+                #label_name = pre_class + '_%s-%s' %(pre_test,class_label.name.split('-')[-1])
+                if pre_test != pre_class:
+                    pre_class += ',%s' % pre_test
+                    pre_class = list(set(pre_class.split(',')))
+                    new_pre = ''
+                    for pre in pre_class[:-1]:
+                        new_pre += '%s,' % pre
+                    new_pre += pre_class[-1]
+                    label_name = '%s_' % (new_pre) + \
+                        class_label.name.split('_')[-1]
+                os.remove(class_list[i])
+                os.remove(test_fn)
+                fn_newlabel = mer_path + '%s.label' %label_name
+                if os.path.isfile(fn_newlabel):
+                    fn_newlabel = fn_newlabel[:fn_newlabel.rfind('_')] + '_new,%s' %fn_newlabel.split('_')[-1]
+                mne.write_label(fn_newlabel, com_label)
+                class_list[i] = fn_newlabel
+                belong = True
+            i = i + 1
+        if belong is False:
+            class_list.append(test_fn)
+    return len(class_list)
+
+def apply_merge(labels_path, evt_list):
+    import glob, shutil
+    mer_path = labels_path + 'ROIs/merge/'
+    reset_directory(mer_path)
+    source = []
+    for evt in evt_list:
+        source_path = labels_path + '/%s/ini/' %evt
+        source = source + glob.glob(os.path.join(source_path, '*.*'))
+    for filename in source:
+        shutil.copy(filename, mer_path)
+    reducer = True
+    while reducer:
+        list_dirs = os.walk(mer_path)
+        label_list = ['']
+        for root, dirs, files in list_dirs:
+            for f in files:
+                label_fname = os.path.join(root, f)
+                label_list.append(label_fname)
+        label_list = label_list[1:]
+        len_class = _cluster1_rois(mer_path, label_list)
+        if len_class == len(label_list):
+            reducer = False  
+
+def apply_comSTC(stcs_path, evt_list):
+    import glob
+    stcs = []
+    for evt in evt_list:
+        fname = stcs_path + evt
+        stc = mne.read_source_estimate(fname)
+        stcs.append(stc) 
+    stcs = np.array(stcs)
+    stc_avg = np.sum(stcs, axis=0)/stcs.shape[0]
+    fn_avg = subjects_dir+'/fsaverage/dSPM_ROIs/common' 
+    stc_avg.save(fn_avg, ftype='stc')
+
+def apply_stand(fn_stc, radius=5.0, min_subject='fsaverage'):
+
+    """
+    ----------
+    fname: averaged STC of the trials.
+    radius: the radius of every ROI. 
+    """
+    fnlist = get_files_from_list(fn_stc)
+    # loop across all filenames
+    for fn_stc in fnlist:
+        import glob, shutil
+        labels_path = os.path.split(fn_stc)[0]
+        stan_path = labels_path + '/ROIs/stand/' 
+        reset_directory(stan_path)
+        source_path = labels_path + '/ROIs/merge/' 
+        source = glob.glob(os.path.join(source_path, '*.*'))
+        for filename in source:
+            shutil.copy(filename, stan_path)
+        stc = mne.read_source_estimate(fn_stc, subject=min_subject)
+        list_dirs = os.walk(stan_path)
+        for root, dirs, files in list_dirs:
+            for f in files:
+                label_fname = os.path.join(root, f)
+                label = mne.read_label(label_fname)
+                stc_label = stc.in_label(label)
+                src_pow = np.sum(stc_label.data ** 2, axis=1)
+                if label.hemi == 'lh':
+                    # Get the max MNE value within each ROI
+                    seed_vertno = stc_label.vertices[0][np.argmax(src_pow)]
+                    func_label = mne.grow_labels(min_subject, seed_vertno,
+                                                 extents=radius, hemis=0,
+                                                 subjects_dir=subjects_dir,
+                                                 n_jobs=1)
+                    func_label = func_label[0]
+                    func_label.save(stan_path + '%s' %f)
+                elif label.hemi == 'rh':
+                    seed_vertno = stc_label.vertices[1][np.argmax(src_pow)]
+                    func_label = mne.grow_labels(min_subject, seed_vertno,
+                                                 extents=radius, hemis=1,
+                                                 subjects_dir=subjects_dir,
+                                                 n_jobs=1)
+                    func_label = func_label[0]
+                    func_label.save(stan_path + '%s' %f)
