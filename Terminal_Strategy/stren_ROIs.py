@@ -90,7 +90,7 @@ def apply_norm(fn_stc, event, ref_event, thr=95):
         zc_data[norm_mean == 0, :] = 0
         #import pdb
         #pdb.set_trace()
-        #print zc_data.min()
+        print zc_data.min()
         stc.data.setfield(zc_data, np.float32)
         stcs.append(stc)
         fn_nr = fname[:fname.rfind('-lh')] + '_norm_1'
@@ -100,7 +100,7 @@ def apply_norm(fn_stc, event, ref_event, thr=95):
     stc_avg = np.sum(stcs, axis=0)/stcs.shape[0]
     stc_avg.save(fn_avg, ftype='stc')
 
-def apply_rois(fn_stc_list, event, min_subject='fsaverage', tmin=0.0, tmax=0.3, thr=0.6):
+def apply_rois(fn_stc_list, event, min_subject='fsaverage', radius=8., tmin=0.0, tmax=0.3, thr=95):
     """
     Compute regions of interest (ROI) based on events
     ----------
@@ -117,6 +117,8 @@ def apply_rois(fn_stc_list, event, min_subject='fsaverage', tmin=0.0, tmax=0.3, 
     """
     #from scipy.signal import detrend
     #from scipy.stats.mstats import zscore 
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import PCA
     fnlist = get_files_from_list(fn_stc_list)
     # loop across all filenames
     for fn_stc in fnlist:
@@ -130,153 +132,61 @@ def apply_rois(fn_stc_list, event, min_subject='fsaverage', tmin=0.0, tmax=0.3, 
       
         # Read the MNI source space
         stc = mne.read_source_estimate(fn_stc)
-        stc_mean = stc.copy().crop(tmin, tmax).mean()
-        data = np.abs(stc_mean.data)
-        stc_mean.data[data < thr * np.max(data)] = 0.
-        src_inv = mne.read_source_spaces(fn_src)
-        func_labels_lh, func_labels_rh = mne.stc_to_label(
-                    stc_mean, src=src_inv, smooth=True,
-                    subjects_dir=subjects_dir,
-                    connected=True)
-        # Left hemisphere definition
-        i = 0
-        while i < len(func_labels_lh):
-            func_label = func_labels_lh[i]
-            func_label.save(labels_path + '/%s_%d' %(event, i))
-            i = i + 1
-        # right hemisphere definition
-        j = 0
-        while j < len(func_labels_rh):
-            func_label = func_labels_rh[j]
-            func_label.save(labels_path + '/%s_%d' %(event, j))
-            j = j + 1
-
-def _sortlist(label_list, stc, src):
-    sort_list = []
-    sort_list.append(label_list[0])
-    for test_fn in label_list[1:]:
-        test_label = mne.read_label(test_fn)
-        i = 0
-        insert = False
-        while (i < len(sort_list)) and insert == False:
-            class_label = mne.read_label(sort_list[i])
-            class_pca = stc.extract_label_time_course(class_label, src, mode='pca_flip')
-            test_pca = stc.extract_label_time_course(test_label, src, mode='pca_flip')
-            class_pca = np.squeeze(class_pca)
-            test_pca = np.squeeze(test_pca)
-            class_pow = np.sum(class_pca ** 2)
-            test_pow = np.sum(test_pca ** 2)
-            # sort the list
-            if test_pow < class_pow:
-                sort_list.insert(i, test_fn)
-                insert = True
-            i = i + 1
-             
-        if insert == False:
-            sort_list.append(test_fn)
-       
-    return sort_list
+        stc_intr = stc.copy().crop(tmin, tmax)
+        src_pow = np.sum(stc_intr.data, axis=1)
+        stc_intr.data[src_pow < np.percentile(src_pow, thr)] = 0.
+        cal_mean=stc_intr.data.mean(axis=-1)
+        non_data=stc_intr.data[cal_mean>0]
+        inds = np.argwhere(cal_mean)
+        pca = PCA(n_components=8).fit(non_data)
+        kmeans = KMeans(init=pca.components_, n_clusters=8)
+        kmeans.fit(non_data)
+        codebook = kmeans.cluster_centers_
+        #book = np.array((whitened[1], 5)
+        #codebook, distortion = kmeans(whitened,9, iter=1000)
+        centroids = []
+        c_ins = []
+        centroid = non_data[0]
+        for cb in codebook:
+            min_diff =  np.abs(np.linalg.norm(cb) - np.linalg.norm(non_data[0]))
+            c_in = 0
+            i = 1
+            while i < len(non_data):
+                wt = non_data[i]
+                diff =  np.abs(np.linalg.norm(cb) - np.linalg.norm(wt))
+                if min_diff > diff:
+                    centroid = wt
+                    min_diff = diff
+                    c_in = i
+                i = i + 1
+            centroids.append(centroid)
+            c_ins.append(c_in)
+            
+        centroids = np.array(centroids)    
+        c_ins = np.array(c_ins)        
+        c_stc=inds[c_ins]
+        seeds = np.squeeze(c_stc)
+        non_index_lh = seeds[seeds < 10242]
+        if non_index_lh.shape != []:    
+            func_labels_lh = mne.grow_labels(min_subject, non_index_lh,
+                                            extents=radius, hemis=0, 
+                                            subjects_dir=subjects_dir, n_jobs=1)
+            i = 0
+            while i < len(func_labels_lh):
+                func_label = func_labels_lh[i]
+                func_label.save(labels_path + '/%s_%d' %(event, i))
+                i = i + 1
+                
+        seeds_rh = seeds - 10242
+        non_index_rh = seeds_rh[seeds_rh > 0]
+        if non_index_rh.shape != []:
+            func_labels_rh = mne.grow_labels(min_subject, non_index_rh,
+                                            extents=radius, hemis=1,
+                                            subjects_dir=subjects_dir, n_jobs=1)                                             
     
-def _cluster_rois(sel_path, label_list, stc, src, min_dist, mni_subject='fsaverage'):
-    """
-    subfunctions of merge_ROIs
-    ----------
-    mer_path: str
-        The directory for storing merged ROIs.
-    label_list: list
-        Labels to be merged
-    """
-    class_list = []
-    label_list = _sortlist(label_list, stc, src)
-    class_list.append(label_list[0])
-    for test_fn in label_list[1:]:
-        test_label = mne.read_label(test_fn)
-        i = 0
-        belong = False
-        while (i < len(class_list)) and (belong is False):
-            class_label = mne.read_label(class_list[i])
-            if test_label.hemi != class_label.hemi:
-                i = i + 1
-                continue
-            else:
-                # Get the centroids
-                class_stc = stc.in_label(class_label)
-                test_stc = stc.in_label(test_label)
-                class_pca = stc.extract_label_time_course(class_label, src, mode='pca_flip')
-                test_pca = stc.extract_label_time_course(test_label, src, mode='pca_flip')
-                class_pca = np.squeeze(class_pca)
-                test_pca = np.squeeze(test_pca)
-                class_pow = np.sum(class_pca ** 2)
-                test_pow = np.sum(test_pca ** 2)
-                
-                if class_label.hemi == 'lh':
-                    h = 0
-                elif class_label.hemi == 'rh':
-                    h = 1
-                class_seed, _, _ = class_stc.center_of_mass(mni_subject, hemi=h)
-                test_seed, _, _ = test_stc.center_of_mass(mni_subject, hemi=h)
-                class_mni = mne.vertex_to_mni(class_seed, h, mni_subject)[0]
-                test_mni = mne.vertex_to_mni(test_seed, h, mni_subject)[0]
-                
-                exch = False
-                if np.max(class_pow) < np.max(test_pow):
-                    exch = True
-                
-                # Compute the centroids distance   
-                if np.linalg.norm(class_mni - test_mni) < min_dist:
-                    if exch == True:
-                        os.remove(class_list[i])
-                        class_list[i] = test_fn
-                        class_list = _sortlist(class_list, stc, src)
-                    elif exch == False:
-                        os.remove(test_fn)
-                    belong = True
-                i = i + 1
-                
-        if belong is False:
-            class_list.append(test_fn)
-            class_list = _sortlist(class_list, stc, src)
-                
-    return len(class_list)
-
-
-def apply_sele(fn_stc_list, fn_src, event, min_dist):
-    """
-    select ROIs, so that the overlapped lables merged into one. 
-    If 'group' is False, ROIs from all the events are merged and 
-    saved in the folder 'ROIs' under the 'labels_path'.
-    If 'group' is True, ROIs from all the subjects are merged and
-    saved in the folder 'merged' under the 'labels_path'.
-    ----------
-    labels_path: the total path of all the ROIs' folders.
-    group: if 'group' is False, merge ROIs from different events within one
-           subject, if 'group' is True, merge ROIs across subjects.
-    evelist: events name of all subfolders
-    """
-    fn_stc_list = get_files_from_list(fn_stc_list)
-    # loop across all filenames
-    for fn_stc in fn_stc_list:
-        import glob, shutil
-        labels_path = os.path.split(fn_stc)[0]
-        sel_path = labels_path + '/%s/sele/' %event 
-        reset_directory(sel_path)
-        source_path = labels_path + '/%s/ini/' %event 
-        source = glob.glob(os.path.join(source_path, '*.*'))
-        for filename in source:
-            shutil.copy(filename, sel_path) 
-        reducer = True
-        stc = mne.read_source_estimate(fn_stc)
-        stc.data[stc.data < 0] = 0
-        #stc = stc.crop(tmin, tmax)
-        src = mne.read_source_spaces(fn_src)
-        while reducer:
-            list_dirs = os.walk(sel_path)
-            label_list = ['']
-            for root, dirs, files in list_dirs:
-                for f in files:
-                    label_fname = os.path.join(root, f)
-                    label_list.append(label_fname)
-            label_list = label_list[1:]
-            len_class = _cluster_rois(sel_path, label_list, stc, src, min_dist)
-            if len_class == len(label_list):
-                reducer = False  
+            # right hemisphere definition
+            j = 0
+            while j < len(func_labels_rh):
+                func_label = func_labels_rh[j]
+                func_label.save(labels_path + '/%s_%d' %(event, j))
+                j = j + 1
